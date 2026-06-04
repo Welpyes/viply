@@ -12,6 +12,8 @@ typedef struct {
     bool strip;
     bool keep_date;
     int resolution; // percentage
+    bool recursive;
+    bool dry_run;
     char *input;
     char *output;
 } ViplyOptions;
@@ -23,6 +25,7 @@ typedef struct {
 void viply_free_ptr(void *p);
 void viply_unref_vips(void *p);
 
-int viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path);
+// Returns size in bytes if dry_run, 0 on success, -1 on error
+long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path);
 
 #endif

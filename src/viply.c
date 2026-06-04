@@ -14,7 +14,7 @@ void viply_unref_vips(void *p) {
     if (*ptr) g_object_unref(*ptr);
 }
 
-int viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path) {
+long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path) {
     autovips VipsImage *in = vips_image_new_from_file(input_path, NULL);
     if (!in) return -1;
 
@@ -31,11 +31,26 @@ int viply_process_file(const ViplyOptions *opts, const char *input_path, const c
 
     // Determine format
     bool to_jpeg = opts->use_jpeg;
-    // Auto-detect from output extension if not forced
     if (!to_jpeg && output_path) {
         if (strstr(output_path, ".jpg") || strstr(output_path, ".jpeg")) {
             to_jpeg = true;
         }
+    }
+
+    if (opts->dry_run) {
+        void *buf;
+        size_t len;
+        int result;
+        if (to_jpeg) {
+            result = vips_jpegsave_buffer(processed, &buf, &len, "Q", opts->quality, "strip", opts->strip, "optimize_coding", TRUE, NULL);
+        } else {
+            result = vips_webpsave_buffer(processed, &buf, &len, "Q", opts->quality, "effort", opts->compression, "strip", opts->strip, NULL);
+        }
+        if (result == 0) {
+            g_free(buf);
+            return (long)len;
+        }
+        return -1;
     }
 
     int result = 0;
@@ -46,7 +61,6 @@ int viply_process_file(const ViplyOptions *opts, const char *input_path, const c
             "optimize_coding", TRUE,
             NULL);
     } else {
-        // Default WebP
         result = vips_webpsave(processed, output_path,
             "Q", opts->quality,
             "effort", opts->compression,
@@ -64,5 +78,5 @@ int viply_process_file(const ViplyOptions *opts, const char *input_path, const c
         }
     }
 
-    return result;
+    return result == 0 ? 0 : -1;
 }
