@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <utime.h>
+#include <string.h>
 
 void viply_free_ptr(void *p) {
     void **ptr = (void **)p;
@@ -14,7 +15,14 @@ void viply_unref_vips(void *p) {
     if (*ptr) g_object_unref(*ptr);
 }
 
-long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path) {
+static void eval_cb(VipsImage *image, VipsProgress *progress, _Atomic int *p_val) {
+    (void)image;
+    if (p_val) {
+        atomic_store(p_val, progress->percent);
+    }
+}
+
+long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path, _Atomic int *progress) {
     autovips VipsImage *in = vips_image_new_from_file(input_path, NULL);
     if (!in) return -1;
 
@@ -27,6 +35,13 @@ long viply_process_file(const ViplyOptions *opts, const char *input_path, const 
     } else {
         processed = in;
         g_object_ref(processed);
+    }
+
+    // Enable progress tracking
+    vips_image_set_progress(processed, TRUE);
+    if (progress) {
+        atomic_store(progress, 0);
+        g_signal_connect(processed, "eval", G_CALLBACK(eval_cb), progress);
     }
 
     // Determine format

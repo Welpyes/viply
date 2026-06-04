@@ -3,6 +3,7 @@
 
 #include <vips/vips.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 typedef struct {
     bool use_jpeg;
@@ -26,6 +27,7 @@ void viply_free_ptr(void *p);
 void viply_unref_vips(void *p);
 
 // Returns size in bytes if dry_run, 0 on success, -1 on error
-long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path);
+// progress is 0-100 atomic int
+long viply_process_file(const ViplyOptions *opts, const char *input_path, const char *output_path, _Atomic int *progress);
 
 #endif

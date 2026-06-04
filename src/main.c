@@ -34,55 +34,58 @@ typedef struct {
     const ViplyOptions *opts;
     FileJob *jobs;
     int total_jobs;
-    atomic_int *current_idx;
-    atomic_int *finished_count;
-    atomic_long *total_in_size;
-    atomic_long *total_out_size;
-    char **active_files; // Array of size 'jobs' to track active filenames
-    pthread_mutex_t ui_mutex;
+    atomic_int current_idx;
+    atomic_int finished_count;
+    atomic_long total_in_size;
+    atomic_long total_out_size;
+    char **active_files;
+    _Atomic int *active_progress;
+    char **completed_queue;
+    atomic_int completed_head;
+    atomic_int completed_tail;
+    pthread_mutex_t state_mutex;
 } ThreadData;
 
-void draw_ui(ThreadData *td, int worker_id, const char *filename, bool finished) {
-    pthread_mutex_lock(&td->ui_mutex);
+void draw_ui(ThreadData *td) {
+    pthread_mutex_lock(&td->state_mutex);
 
-    int total = td->total_jobs;
-    int finished_count = atomic_load(td->finished_count);
-    
-    // 1. Clear active zone and progress bar
-    // Move up (jobs + 3) lines: 'jobs' for active + 1 for header + 1 for separator + 1 for progress bar
-    printf("\033[%dA", td->opts->jobs + 3);
-    
-    // 2. If finished, print to scrolling "Completed" section
-    if (finished) {
-        printf("\r\033[2K%-50s [COMPLETE]\n", filename);
-    } else {
-        // Just maintain the line if starting
+    // 1. Process completed queue (scrolling section)
+    // These print at the CURRENT cursor position, pushing the "Active" section down
+    while (td->completed_head != td->completed_tail) {
+        char *fname = td->completed_queue[td->completed_head];
+        // Clear line, print completed, then a newline to "scroll"
+        printf("\r\033[2K%-50s [COMPLETE]\n", fname);
+        free(fname);
+        td->completed_head = (td->completed_head + 1) % (td->total_jobs + 1);
     }
 
-    // 3. Active Header
+    // 2. Active section
+    // Always clear and rewrite fixed-size section below the scroll
     printf("\033[2K--- COMPRESSING ---\n");
-
-    // 4. Print "Active" section
-    if (filename) {
-        if (finished) td->active_files[worker_id] = NULL;
-        else td->active_files[worker_id] = (char *)filename;
-    }
-
     for (int i = 0; i < td->opts->jobs; i++) {
-        printf("\033[2K"); // Clear line
+        printf("\033[2K");
         if (td->active_files[i]) {
-            printf("  %-50s\n", td->active_files[i]);
+            int p = atomic_load(&td->active_progress[i]);
+            int p_width = 20;
+            int p_pos = (p * p_width) / 100;
+            printf("  %-30s [", td->active_files[i]);
+            for (int j = 0; j < p_width; j++) {
+                if (j < p_pos) printf("=");
+                else if (j == p_pos) printf(">");
+                else printf(" ");
+            }
+            printf("] %3d%%\n", p);
         } else {
             printf("  --\n");
         }
     }
 
-    // 5. Separator
+    // 3. Footer
     printf("\033[2K------------------------------------------------------------\n");
-
-    // 6. Progress Bar
+    int finished = atomic_load(&td->finished_count);
+    int total = td->total_jobs;
     int width = 40;
-    float ratio = (float)finished_count / total;
+    float ratio = total > 0 ? (float)finished / total : 0;
     int pos = width * ratio;
     printf("\033[2K[");
     for (int i = 0; i < width; i++) {
@@ -90,10 +93,26 @@ void draw_ui(ThreadData *td, int worker_id, const char *filename, bool finished)
         else if (i == pos) printf(">");
         else printf(" ");
     }
-    printf("] %d%% (%d/%d)", (int)(ratio * 100), finished_count, total);
-    printf("\n");
+    printf("] %d%% (%d/%d)\n", (int)(ratio * 100), finished, total);
 
-    pthread_mutex_unlock(&td->ui_mutex);
+    // Move cursor back up (jobs + 3) lines to start of "Active" section for next refresh
+    printf("\033[%dA", td->opts->jobs + 3);
+    fflush(stdout);
+
+    pthread_mutex_unlock(&td->state_mutex);
+}
+
+void *ui_refresher(void *arg) {
+    ThreadData *td = (ThreadData *)arg;
+    
+    while (atomic_load(&td->finished_count) < td->total_jobs) {
+        draw_ui(td);
+        usleep(100000); // 10fps
+    }
+    draw_ui(td);
+    // Move to bottom for final summary
+    printf("\033[%dB\n", td->opts->jobs + 3);
+    return NULL;
 }
 
 void *worker(void *arg) {
@@ -103,33 +122,44 @@ void *worker(void *arg) {
     free(arg);
 
     while (1) {
-        int idx = atomic_fetch_add(td->current_idx, 1);
+        int idx = atomic_fetch_add(&td->current_idx, 1);
         if (idx >= td->total_jobs) break;
 
         FileJob *job = &td->jobs[idx];
         char *fname = basename(job->in);
 
-        draw_ui(td, worker_id, fname, false);
+        pthread_mutex_lock(&td->state_mutex);
+        td->active_files[worker_id] = fname;
+        atomic_store(&td->active_progress[worker_id], 0);
+        pthread_mutex_unlock(&td->state_mutex);
 
         struct stat st;
+        long in_size = 0;
         if (stat(job->in, &st) == 0) {
-            atomic_fetch_add(td->total_in_size, st.st_size);
+            in_size = st.st_size;
+            atomic_fetch_add(&td->total_in_size, in_size);
         }
 
-        long res = viply_process_file(td->opts, job->in, job->out);
+        long res = viply_process_file(td->opts, job->in, job->out, &td->active_progress[worker_id]);
+        
+        long out_size = 0;
         if (res >= 0) {
             if (td->opts->dry_run) {
-                atomic_fetch_add(td->total_out_size, res);
+                out_size = res;
             } else {
                 struct stat out_st;
-                if (stat(job->out, &out_st) == 0) {
-                    atomic_fetch_add(td->total_out_size, out_st.st_size);
-                }
+                if (stat(job->out, &out_st) == 0) out_size = out_st.st_size;
             }
+            atomic_fetch_add(&td->total_out_size, out_size);
         }
 
-        atomic_fetch_add(td->finished_count, 1);
-        draw_ui(td, worker_id, fname, true);
+        pthread_mutex_lock(&td->state_mutex);
+        td->active_files[worker_id] = NULL;
+        td->completed_queue[td->completed_tail] = strdup(fname);
+        td->completed_tail = (td->completed_tail + 1) % (td->total_jobs + 1);
+        pthread_mutex_unlock(&td->state_mutex);
+
+        atomic_fetch_add(&td->finished_count, 1);
     }
     return NULL;
 }
@@ -137,13 +167,10 @@ void *worker(void *arg) {
 void scan_directory(const char *in_dir, const char *out_dir, const ViplyOptions *opts, FileJob **jobs, int *count, int *capacity) {
     DIR *d = opendir(in_dir);
     if (!d) return;
-
     struct dirent *dir;
     while ((dir = readdir(d)) != NULL) {
         if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) continue;
-
         char *full_in = path_join(in_dir, dir->d_name);
-        
         if (dir->d_type == DT_DIR && opts->recursive) {
             char *full_out = path_join(out_dir, dir->d_name);
             if (!opts->dry_run) mkdir(full_out, 0755);
@@ -151,23 +178,20 @@ void scan_directory(const char *in_dir, const char *out_dir, const ViplyOptions 
             free(full_in);
             free(full_out);
         } else if (dir->d_type == DT_REG) {
-            if (strstr(dir->d_name, ".jpg") || strstr(dir->d_name, ".jpeg") || 
-                strstr(dir->d_name, ".png") || strstr(dir->d_name, ".webp")) {
-                
+            const char *ext = strrchr(dir->d_name, '.');
+            if (ext && (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0 || 
+                        strcasecmp(ext, ".png") == 0 || strcasecmp(ext, ".webp") == 0)) {
                 if (*count >= *capacity) {
                     *capacity *= 2;
                     *jobs = realloc(*jobs, *capacity * sizeof(FileJob));
                 }
-
                 char *name = get_filename_without_ext(dir->d_name);
-                const char *ext = opts->use_jpeg ? ".jpg" : ".webp";
-                char *out_name = malloc(strlen(name) + strlen(ext) + 1);
-                sprintf(out_name, "%s%s", name, ext);
-                
+                const char *out_ext = opts->use_jpeg ? ".jpg" : ".webp";
+                char *out_name = malloc(strlen(name) + strlen(out_ext) + 1);
+                sprintf(out_name, "%s%s", name, out_ext);
                 (*jobs)[*count].in = full_in;
                 (*jobs)[*count].out = path_join(out_dir, out_name);
                 (*count)++;
-                
                 free(name);
                 free(out_name);
             } else {
@@ -180,8 +204,18 @@ void scan_directory(const char *in_dir, const char *out_dir, const ViplyOptions 
     closedir(d);
 }
 
+// Silence GLib/VIPS warnings that break the UI
+static void null_log_handler(const char *log_domain, GLogLevelFlags log_level, const char *message, gpointer user_data) {
+    (void)log_domain; (void)log_level; (void)message; (void)user_data;
+}
+
 int main(int argc, char **argv) {
+    // Suppress warnings before they start
+    g_log_set_handler("VIPS", G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE, null_log_handler, NULL);
+    g_log_set_handler(NULL, G_LOG_LEVEL_WARNING | G_LOG_LEVEL_MESSAGE, null_log_handler, NULL);
+
     if (VIPS_INIT(argv[0])) return 1;
+    vips_concurrency_set(1); // Set global, once
 
     ViplyOptions opts = {
         .use_jpeg = false,
@@ -234,14 +268,12 @@ int main(int argc, char **argv) {
 
     FileJob *jobs = NULL;
     int total_jobs = 0;
-
     if (is_directory(input)) {
         if (!output) {
-            fprintf(stderr, "Error: Output directory required for directory input\n");
+            fprintf(stderr, "Error: Output directory required\n");
             return 1;
         }
         if (!opts.dry_run) mkdir(output, 0755);
-
         int capacity = 100;
         jobs = malloc(capacity * sizeof(FileJob));
         scan_directory(input, output, &opts, &jobs, &total_jobs, &capacity);
@@ -262,19 +294,27 @@ int main(int argc, char **argv) {
     }
 
     if (total_jobs > 0) {
-        vips_concurrency_set(1);
-        atomic_int current_idx = 0;
-        atomic_int finished_count = 0;
-        atomic_long total_in_size = 0;
-        atomic_long total_out_size = 0;
+        ThreadData td = {
+            .opts = &opts,
+            .jobs = jobs,
+            .total_jobs = total_jobs,
+            .current_idx = 0,
+            .finished_count = 0,
+            .total_in_size = 0,
+            .total_out_size = 0,
+            .active_files = calloc(opts.jobs, sizeof(char *)),
+            .active_progress = calloc(opts.jobs, sizeof(_Atomic int)),
+            .completed_queue = calloc(total_jobs + 1, sizeof(char *)),
+            .completed_head = 0,
+            .completed_tail = 0,
+            .state_mutex = PTHREAD_MUTEX_INITIALIZER
+        };
 
-        char **active_files = calloc(opts.jobs, sizeof(char *));
-        pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
-        
-        ThreadData td = {&opts, jobs, total_jobs, &current_idx, &finished_count, &total_in_size, &total_out_size, active_files, ui_mutex};
-
-        // Prep UI space
+        // UI Prep: Create space for the fixed active section
         for (int i = 0; i < opts.jobs + 3; i++) printf("\n");
+
+        pthread_t refresher;
+        pthread_create(&refresher, NULL, ui_refresher, &td);
 
         pthread_t *threads = malloc(opts.jobs * sizeof(pthread_t));
         for (int i = 0; i < opts.jobs; i++) {
@@ -283,20 +323,22 @@ int main(int argc, char **argv) {
             args[1] = (void *)(size_t)i;
             pthread_create(&threads[i], NULL, worker, args);
         }
-        for (int i = 0; i < opts.jobs; i++) {
-            pthread_join(threads[i], NULL);
-        }
 
-        if (total_in_size > 0) {
-            double saved = (double)(total_in_size - total_out_size) / total_in_size * 100.0;
-            printf("\nSummary: %.2fMB -> %.2fMB (Saved %.1f%%)\n", 
-                (double)total_in_size / 1024 / 1024, 
-                (double)total_out_size / 1024 / 1024, 
+        for (int i = 0; i < opts.jobs; i++) pthread_join(threads[i], NULL);
+        pthread_join(refresher, NULL);
+
+        if (td.total_in_size > 0) {
+            double saved = (double)(td.total_in_size - td.total_out_size) / td.total_in_size * 100.0;
+            printf("Summary: %.2fMB -> %.2fMB (Saved %.1f%%)\n", 
+                (double)td.total_in_size / 1024 / 1024, 
+                (double)td.total_out_size / 1024 / 1024, 
                 saved);
         }
 
         free(threads);
-        free(active_files);
+        free(td.active_files);
+        free(td.active_progress);
+        free(td.completed_queue);
         for (int i = 0; i < total_jobs; i++) {
             free(jobs[i].in);
             free(jobs[i].out);
