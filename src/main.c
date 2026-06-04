@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
+#include <libgen.h>
 #include "viply.h"
 #include "utils.h"
 
@@ -34,32 +35,82 @@ typedef struct {
     FileJob *jobs;
     int total_jobs;
     atomic_int *current_idx;
+    atomic_int *finished_count;
     atomic_long *total_in_size;
     atomic_long *total_out_size;
+    char **active_files; // Array of size 'jobs' to track active filenames
+    pthread_mutex_t ui_mutex;
 } ThreadData;
 
-void draw_progress(int current, int total) {
+void draw_ui(ThreadData *td, int worker_id, const char *filename, bool finished) {
+    pthread_mutex_lock(&td->ui_mutex);
+
+    int total = td->total_jobs;
+    int finished_count = atomic_load(td->finished_count);
+    
+    // 1. Clear active zone and progress bar
+    // Move up (jobs + 3) lines: 'jobs' for active + 1 for header + 1 for separator + 1 for progress bar
+    printf("\033[%dA", td->opts->jobs + 3);
+    
+    // 2. If finished, print to scrolling "Completed" section
+    if (finished) {
+        printf("\r\033[2K%-50s [COMPLETE]\n", filename);
+    } else {
+        // Just maintain the line if starting
+    }
+
+    // 3. Active Header
+    printf("\033[2K--- COMPRESSING ---\n");
+
+    // 4. Print "Active" section
+    if (filename) {
+        if (finished) td->active_files[worker_id] = NULL;
+        else td->active_files[worker_id] = (char *)filename;
+    }
+
+    for (int i = 0; i < td->opts->jobs; i++) {
+        printf("\033[2K"); // Clear line
+        if (td->active_files[i]) {
+            printf("  %-50s\n", td->active_files[i]);
+        } else {
+            printf("  --\n");
+        }
+    }
+
+    // 5. Separator
+    printf("\033[2K------------------------------------------------------------\n");
+
+    // 6. Progress Bar
     int width = 40;
-    float ratio = (float)current / total;
+    float ratio = (float)finished_count / total;
     int pos = width * ratio;
-    printf("\r[");
+    printf("\033[2K[");
     for (int i = 0; i < width; i++) {
         if (i < pos) printf("=");
         else if (i == pos) printf(">");
         else printf(" ");
     }
-    printf("] %d%% (%d/%d)", (int)(ratio * 100), current, total);
-    fflush(stdout);
+    printf("] %d%% (%d/%d)", (int)(ratio * 100), finished_count, total);
+    printf("\n");
+
+    pthread_mutex_unlock(&td->ui_mutex);
 }
 
 void *worker(void *arg) {
-    ThreadData *td = (ThreadData *)arg;
+    void **args = (void **)arg;
+    ThreadData *td = (ThreadData *)args[0];
+    int worker_id = (int)(size_t)args[1];
+    free(arg);
+
     while (1) {
         int idx = atomic_fetch_add(td->current_idx, 1);
         if (idx >= td->total_jobs) break;
 
         FileJob *job = &td->jobs[idx];
-        
+        char *fname = basename(job->in);
+
+        draw_ui(td, worker_id, fname, false);
+
         struct stat st;
         if (stat(job->in, &st) == 0) {
             atomic_fetch_add(td->total_in_size, st.st_size);
@@ -76,11 +127,9 @@ void *worker(void *arg) {
                 }
             }
         }
-        
-        // Progress update by one thread
-        if (idx % 5 == 0 || idx == td->total_jobs - 1) {
-            draw_progress(idx + 1, td->total_jobs);
-        }
+
+        atomic_fetch_add(td->finished_count, 1);
+        draw_ui(td, worker_id, fname, true);
     }
     return NULL;
 }
@@ -215,29 +264,39 @@ int main(int argc, char **argv) {
     if (total_jobs > 0) {
         vips_concurrency_set(1);
         atomic_int current_idx = 0;
+        atomic_int finished_count = 0;
         atomic_long total_in_size = 0;
         atomic_long total_out_size = 0;
 
-        pthread_t *threads = malloc(opts.jobs * sizeof(pthread_t));
-        ThreadData td = {&opts, jobs, total_jobs, &current_idx, &total_in_size, &total_out_size};
+        char **active_files = calloc(opts.jobs, sizeof(char *));
+        pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+        
+        ThreadData td = {&opts, jobs, total_jobs, &current_idx, &finished_count, &total_in_size, &total_out_size, active_files, ui_mutex};
 
+        // Prep UI space
+        for (int i = 0; i < opts.jobs + 3; i++) printf("\n");
+
+        pthread_t *threads = malloc(opts.jobs * sizeof(pthread_t));
         for (int i = 0; i < opts.jobs; i++) {
-            pthread_create(&threads[i], NULL, worker, &td);
+            void **args = malloc(2 * sizeof(void *));
+            args[0] = &td;
+            args[1] = (void *)(size_t)i;
+            pthread_create(&threads[i], NULL, worker, args);
         }
         for (int i = 0; i < opts.jobs; i++) {
             pthread_join(threads[i], NULL);
         }
-        printf("\nDone.\n");
 
         if (total_in_size > 0) {
             double saved = (double)(total_in_size - total_out_size) / total_in_size * 100.0;
-            printf("Summary: %.2fMB -> %.2fMB (Saved %.1f%%)\n", 
+            printf("\nSummary: %.2fMB -> %.2fMB (Saved %.1f%%)\n", 
                 (double)total_in_size / 1024 / 1024, 
                 (double)total_out_size / 1024 / 1024, 
                 saved);
         }
 
         free(threads);
+        free(active_files);
         for (int i = 0; i < total_jobs; i++) {
             free(jobs[i].in);
             free(jobs[i].out);
